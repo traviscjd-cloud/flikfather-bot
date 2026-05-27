@@ -1,9 +1,16 @@
 import os
 import logging
 import psycopg2
-from datetime import datetime, date
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from datetime import date
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -42,7 +49,13 @@ def init_db():
         link TEXT NOT NULL,
         reward INTEGER DEFAULT 25,
         active BOOLEAN DEFAULT TRUE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP + INTERVAL '1 hour'),
+        target_completions INTEGER DEFAULT 10,
+        target_likes INTEGER DEFAULT 0,
+        target_comments INTEGER DEFAULT 0,
+        target_reposts INTEGER DEFAULT 0,
+        target_bookmarks INTEGER DEFAULT 0
     );
     """)
 
@@ -56,14 +69,27 @@ def init_db():
     );
     """)
 
+    cur.execute("ALTER TABLE raids ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP + INTERVAL '1 hour');")
+    cur.execute("ALTER TABLE raids ADD COLUMN IF NOT EXISTS target_completions INTEGER DEFAULT 10;")
+    cur.execute("ALTER TABLE raids ADD COLUMN IF NOT EXISTS target_likes INTEGER DEFAULT 0;")
+    cur.execute("ALTER TABLE raids ADD COLUMN IF NOT EXISTS target_comments INTEGER DEFAULT 0;")
+    cur.execute("ALTER TABLE raids ADD COLUMN IF NOT EXISTS target_reposts INTEGER DEFAULT 0;")
+    cur.execute("ALTER TABLE raids ADD COLUMN IF NOT EXISTS target_bookmarks INTEGER DEFAULT 0;")
+
     conn.commit()
     cur.close()
     conn.close()
 
 
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+
 def rank_name(xp):
+    if xp >= 10000:
+        return "🌕 Moonbringer"
     if xp >= 5000:
-        return "🔥 FLIK Commander"
+        return "👑 FLIK Commander"
     if xp >= 2500:
         return "🚀 Elite Raider"
     if xp >= 1000:
@@ -75,8 +101,12 @@ def rank_name(xp):
     return "⚡ Spark"
 
 
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
+def raid_buttons():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 Open Raid", callback_data="open_raid")],
+        [InlineKeyboardButton("✅ Complete Raid", callback_data="complete_raid")],
+        [InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")]
+    ])
 
 
 def ensure_user(user):
@@ -93,70 +123,132 @@ def ensure_user(user):
     conn.close()
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user(user)
+def close_expired_raids(cur):
+    cur.execute("""
+        UPDATE raids
+        SET active = FALSE
+        WHERE active = TRUE AND expires_at <= NOW();
+    """)
 
+
+def get_active_raid(cur):
+    close_expired_raids(cur)
+    cur.execute("""
+        SELECT id, link, reward, target_completions, target_likes, target_comments,
+               target_reposts, target_bookmarks, expires_at
+        FROM raids
+        WHERE active = TRUE
+        ORDER BY id DESC
+        LIMIT 1;
+    """)
+    return cur.fetchone()
+
+
+def close_raid_if_done(cur, raid_id):
+    cur.execute("""
+        SELECT target_completions
+        FROM raids
+        WHERE id = %s AND active = TRUE;
+    """, (raid_id,))
+    row = cur.fetchone()
+
+    if not row:
+        return False
+
+    target = row[0]
+
+    cur.execute("SELECT COUNT(*) FROM completions WHERE raid_id = %s;", (raid_id,))
+    count = cur.fetchone()[0]
+
+    if count >= target:
+        cur.execute("UPDATE raids SET active = FALSE WHERE id = %s;", (raid_id,))
+        return True
+
+    return False
+
+
+def format_raid_message(raid_id, link, reward, target_completions, likes, comments, reposts, bookmarks, expires_at):
+    return (
+        f"🚨 RAID LIVE #{raid_id}\n\n"
+        f"{link}\n\n"
+        f"Reward: +{reward} XP\n"
+        f"Completion Target: {target_completions} raiders\n\n"
+        f"🎯 Raid Goals:\n"
+        f"❤️ Likes: {likes}\n"
+        f"💬 Comments: {comments}\n"
+        f"🔁 Reposts: {reposts}\n"
+        f"🔖 Bookmarks: {bookmarks}\n\n"
+        f"⏳ Expires: {expires_at}\n\n"
+        f"Tap below to raid, then complete."
+    )
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.effective_user)
     await update.message.reply_text(
         "🔥 Welcome to Flik Raidar.\n\n"
         "Raid. Earn XP. Climb the leaderboard.\n\n"
         "Commands:\n"
-        "/rank - check your XP\n"
+        "/rank - check XP\n"
         "/leaderboard - top raiders\n"
         "/active - current raid\n"
-        "/complete - complete current raid"
+        "/complete - complete raid\n\n"
+        "Admin:\n"
+        "/raid URL XP completions likes comments reposts bookmarks\n"
+        "/settargets raid_id completions likes comments reposts bookmarks\n"
+        "/endraid"
     )
 
 
 async def raid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if not is_admin(user_id):
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("Only Flik admins can create raids.")
         return
 
     if not context.args:
-        await update.message.reply_text("Use: /raid https://x.com/post-link")
+        await update.message.reply_text(
+            "Use:\n/raid URL XP completions likes comments reposts bookmarks\n\n"
+            "Example:\n/raid https://x.com/post 25 10 50 20 30 10"
+        )
         return
 
     link = context.args[0]
-    reward = 25
-
-    if len(context.args) > 1:
-        try:
-            reward = int(context.args[1])
-        except ValueError:
-            reward = 25
+    reward = int(context.args[1]) if len(context.args) > 1 else 25
+    target_completions = int(context.args[2]) if len(context.args) > 2 else 10
+    likes = int(context.args[3]) if len(context.args) > 3 else 0
+    comments = int(context.args[4]) if len(context.args) > 4 else 0
+    reposts = int(context.args[5]) if len(context.args) > 5 else 0
+    bookmarks = int(context.args[6]) if len(context.args) > 6 else 0
 
     conn = db()
     cur = conn.cursor()
 
     cur.execute("UPDATE raids SET active = FALSE WHERE active = TRUE;")
-    cur.execute(
-        "INSERT INTO raids (link, reward, active) VALUES (%s, %s, TRUE) RETURNING id;",
-        (link, reward)
-    )
+    cur.execute("""
+        INSERT INTO raids (
+            link, reward, active, expires_at, target_completions,
+            target_likes, target_comments, target_reposts, target_bookmarks
+        )
+        VALUES (%s, %s, TRUE, NOW() + INTERVAL '1 hour', %s, %s, %s, %s, %s)
+        RETURNING id, expires_at;
+    """, (link, reward, target_completions, likes, comments, reposts, bookmarks))
 
-    raid_id = cur.fetchone()[0]
+    raid_id, expires_at = cur.fetchone()
     conn.commit()
     cur.close()
     conn.close()
 
     await update.message.reply_text(
-        f"🚨 RAID LIVE #{raid_id}\n\n"
-        f"{link}\n\n"
-        f"Reward: +{reward} XP\n\n"
-        "Complete the raid, then type /complete"
+        format_raid_message(raid_id, link, reward, target_completions, likes, comments, reposts, bookmarks, expires_at),
+        reply_markup=raid_buttons()
     )
 
 
 async def active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = db()
     cur = conn.cursor()
-
-    cur.execute("SELECT id, link, reward FROM raids WHERE active = TRUE ORDER BY id DESC LIMIT 1;")
-    raid_row = cur.fetchone()
-
+    raid_row = get_active_raid(cur)
+    conn.commit()
     cur.close()
     conn.close()
 
@@ -164,13 +256,9 @@ async def active(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No active raid right now.")
         return
 
-    raid_id, link, reward = raid_row
-
     await update.message.reply_text(
-        f"🚨 Active Raid #{raid_id}\n\n"
-        f"{link}\n\n"
-        f"Reward: +{reward} XP\n\n"
-        "After you raid, type /complete"
+        format_raid_message(*raid_row),
+        reply_markup=raid_buttons()
     )
 
 
@@ -181,16 +269,17 @@ async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = db()
     cur = conn.cursor()
 
-    cur.execute("SELECT id, reward FROM raids WHERE active = TRUE ORDER BY id DESC LIMIT 1;")
-    raid_row = cur.fetchone()
+    raid_row = get_active_raid(cur)
 
     if not raid_row:
-        await update.message.reply_text("No active raid to complete.")
+        conn.commit()
         cur.close()
         conn.close()
+        await update.message.reply_text("No active raid to complete.")
         return
 
-    raid_id, reward = raid_row
+    raid_id = raid_row[0]
+    reward = raid_row[2]
 
     try:
         cur.execute(
@@ -199,9 +288,9 @@ async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except psycopg2.errors.UniqueViolation:
         conn.rollback()
-        await update.message.reply_text("You already completed this raid.")
         cur.close()
         conn.close()
+        await update.message.reply_text("You already completed this raid.")
         return
 
     today = date.today()
@@ -228,6 +317,8 @@ async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         WHERE telegram_id = %s;
     """, (total_reward, new_streak, today, user.id))
 
+    raid_closed = close_raid_if_done(cur, raid_id)
+
     conn.commit()
 
     cur.execute("SELECT xp, raids_completed, streak FROM users WHERE telegram_id = %s;", (user.id,))
@@ -236,7 +327,7 @@ async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.close()
     conn.close()
 
-    await update.message.reply_text(
+    message = (
         "🔥 Raid completed!\n\n"
         f"+{reward} XP\n"
         f"+{streak_bonus} streak bonus\n\n"
@@ -246,6 +337,11 @@ async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Streak: {streak} day(s)"
     )
 
+    if raid_closed:
+        message += "\n\n🎯 Raid target hit. Raid is now closed."
+
+    await update.message.reply_text(message)
+
 
 async def rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -253,15 +349,8 @@ async def rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = db()
     cur = conn.cursor()
-
-    cur.execute("""
-        SELECT xp, raids_completed, streak
-        FROM users
-        WHERE telegram_id = %s;
-    """, (user.id,))
-
+    cur.execute("SELECT xp, raids_completed, streak FROM users WHERE telegram_id = %s;", (user.id,))
     xp, raids_completed, streak = cur.fetchone()
-
     cur.close()
     conn.close()
 
@@ -277,16 +366,13 @@ async def rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = db()
     cur = conn.cursor()
-
     cur.execute("""
         SELECT username, xp, raids_completed
         FROM users
         ORDER BY xp DESC
         LIMIT 10;
     """)
-
     rows = cur.fetchall()
-
     cur.close()
     conn.close()
 
@@ -295,41 +381,56 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = "🏆 FLIK RAIDAR LEADERBOARD\n\n"
-
-    for i, row in enumerate(rows, start=1):
-        username, xp, raids_completed = row
+    for i, (username, xp, raids_completed) in enumerate(rows, start=1):
         text += f"{i}. @{username} — {xp} XP | {raids_completed} raids\n"
 
     await update.message.reply_text(text)
 
 
-async def addxp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def settargets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Only admins can add XP.")
+        await update.message.reply_text("Only admins can adjust raid targets.")
         return
 
-    if len(context.args) < 2:
-        await update.message.reply_text("Use: /addxp telegram_id amount")
+    if len(context.args) < 6:
+        await update.message.reply_text(
+            "Use:\n/settargets raid_id completions likes comments reposts bookmarks\n\n"
+            "Example:\n/settargets 1 20 100 40 60 25"
+        )
         return
 
-    telegram_id = int(context.args[0])
-    amount = int(context.args[1])
+    raid_id = int(context.args[0])
+    completions = int(context.args[1])
+    likes = int(context.args[2])
+    comments = int(context.args[3])
+    reposts = int(context.args[4])
+    bookmarks = int(context.args[5])
 
     conn = db()
     cur = conn.cursor()
 
     cur.execute("""
-        INSERT INTO users (telegram_id, username, xp)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (telegram_id)
-        DO UPDATE SET xp = users.xp + EXCLUDED.xp;
-    """, (telegram_id, "manual_user", amount))
+        UPDATE raids
+        SET target_completions = %s,
+            target_likes = %s,
+            target_comments = %s,
+            target_reposts = %s,
+            target_bookmarks = %s
+        WHERE id = %s;
+    """, (completions, likes, comments, reposts, bookmarks, raid_id))
 
     conn.commit()
     cur.close()
     conn.close()
 
-    await update.message.reply_text(f"Added {amount} XP to {telegram_id}.")
+    await update.message.reply_text(
+        f"🎯 Raid #{raid_id} targets updated:\n\n"
+        f"Completions: {completions}\n"
+        f"Likes: {likes}\n"
+        f"Comments: {comments}\n"
+        f"Reposts: {reposts}\n"
+        f"Bookmarks: {bookmarks}"
+    )
 
 
 async def endraid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -339,14 +440,97 @@ async def endraid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = db()
     cur = conn.cursor()
-
     cur.execute("UPDATE raids SET active = FALSE WHERE active = TRUE;")
-
     conn.commit()
     cur.close()
     conn.close()
 
     await update.message.reply_text("Raid ended.")
+
+
+async def auto_raid_from_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    text = update.message.text.strip()
+
+    if "x.com/" not in text and "twitter.com/" not in text:
+        return
+
+    link = text.split()[0]
+    reward = 25
+    target_completions = 10
+    likes = 50
+    comments = 20
+    reposts = 30
+    bookmarks = 10
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("UPDATE raids SET active = FALSE WHERE active = TRUE;")
+    cur.execute("""
+        INSERT INTO raids (
+            link, reward, active, expires_at, target_completions,
+            target_likes, target_comments, target_reposts, target_bookmarks
+        )
+        VALUES (%s, %s, TRUE, NOW() + INTERVAL '1 hour', %s, %s, %s, %s, %s)
+        RETURNING id, expires_at;
+    """, (link, reward, target_completions, likes, comments, reposts, bookmarks))
+
+    raid_id, expires_at = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    await update.message.reply_text(
+        format_raid_message(raid_id, link, reward, target_completions, likes, comments, reposts, bookmarks, expires_at),
+        reply_markup=raid_buttons()
+    )
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "open_raid":
+        conn = db()
+        cur = conn.cursor()
+        row = get_active_raid(cur)
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        if not row:
+            await query.message.reply_text("No active raid right now.")
+            return
+
+        await query.message.reply_text(f"🚀 Open raid:\n{row[1]}")
+        return
+
+    if query.data == "complete_raid":
+        class FakeMessage:
+            async def reply_text(self, text, **kwargs):
+                await query.message.reply_text(text, **kwargs)
+
+        class FakeUpdate:
+            effective_user = query.from_user
+            message = FakeMessage()
+
+        await complete(FakeUpdate(), context)
+        return
+
+    if query.data == "leaderboard":
+        class FakeMessage:
+            async def reply_text(self, text, **kwargs):
+                await query.message.reply_text(text, **kwargs)
+
+        class FakeUpdate:
+            effective_user = query.from_user
+            message = FakeMessage()
+
+        await leaderboard(FakeUpdate(), context)
+        return
 
 
 def main():
@@ -360,8 +544,10 @@ def main():
     app.add_handler(CommandHandler("complete", complete))
     app.add_handler(CommandHandler("rank", rank))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
-    app.add_handler(CommandHandler("addxp", addxp))
+    app.add_handler(CommandHandler("settargets", settargets))
     app.add_handler(CommandHandler("endraid", endraid))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_raid_from_url))
 
     print("Flik Raidar is live.")
     app.run_polling()
