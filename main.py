@@ -995,7 +995,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await query.message.reply_text(
-            f"🚀 Raid joined.\n\nOpen X here:\n{link}\n\nReturn after {JOIN_DELAY_SECONDS} seconds and tap ✅ Complete Raid.",
+            f"🚀 Raid joined.\n\nOpen X here:\n{link}\n\nClick X Link return and tap ✅ Complete Raid.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Open X Raid", url=link)]])
         )
         return
