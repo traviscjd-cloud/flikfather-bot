@@ -623,7 +623,7 @@ async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
             display_name = f"@{username}"
 
         await update.message.reply_text(
-            f"🚩 {display_name} flagged — potential username manipulation audit required."
+            f"🚩 {display_name} potential manipulation audit required."
         )
         return
 
