@@ -501,7 +501,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Paste an X URL\n"
         "2. Reply with targets like: 25 l100 c40 r60 b10\n\n"
         "User flow:\n"
-        "Join Raid → open X → wait 20 sec → Complete Raid\n\n"
+        "Join Raid → Click X link → Complete Raid\n\n"
         "Commands:\n"
         "/rank\n/leaderboard\n/active\n/complete\n/myid"
     )
