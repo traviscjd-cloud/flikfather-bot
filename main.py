@@ -27,7 +27,7 @@ def db():
 def calc_max_winners(likes, comments, reposts, bookmarks):
     targets = [likes, comments, reposts, bookmarks]
     non_zero = [x for x in targets if x > 0]
-    return min(non_zero) if non_zero else 25
+    return max(non_zero) if non_zero else 25
 
 
 def init_db():
@@ -74,6 +74,7 @@ def init_db():
         id SERIAL PRIMARY KEY,
         telegram_id BIGINT,
         raid_id INTEGER,
+        joined BOOLEAN DEFAULT FALSE,
         eligible BOOLEAN DEFAULT TRUE,
         awarded BOOLEAN DEFAULT FALSE,
         completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -81,7 +82,7 @@ def init_db():
     );
     """)
 
-    raid_columns = [
+    for column in [
         "close_reason TEXT",
         "expires_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP + INTERVAL '1 hour')",
         "max_winners INTEGER DEFAULT 25",
@@ -96,17 +97,14 @@ def init_db():
         "telegram_chat_id BIGINT",
         "telegram_message_id BIGINT",
         "last_bumped_at TIMESTAMP",
-    ]
-
-    completion_columns = [
-        "eligible BOOLEAN DEFAULT TRUE",
-        "awarded BOOLEAN DEFAULT FALSE",
-    ]
-
-    for column in raid_columns:
+    ]:
         cur.execute(f"ALTER TABLE raids ADD COLUMN IF NOT EXISTS {column};")
 
-    for column in completion_columns:
+    for column in [
+        "joined BOOLEAN DEFAULT FALSE",
+        "eligible BOOLEAN DEFAULT TRUE",
+        "awarded BOOLEAN DEFAULT FALSE",
+    ]:
         cur.execute(f"ALTER TABLE completions ADD COLUMN IF NOT EXISTS {column};")
 
     conn.commit()
@@ -136,7 +134,7 @@ def rank_name(xp):
 
 def raid_buttons():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Open Raid", callback_data="open_raid")],
+        [InlineKeyboardButton("🚀 Join Raid on X", callback_data="join_raid")],
         [InlineKeyboardButton("✅ Complete Raid", callback_data="complete_raid")],
         [InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")]
     ])
@@ -209,7 +207,7 @@ def format_raid_message(
         f"🔁 Reposts: {current_reposts}/{target_reposts}\n"
         f"🔖 Bookmarks: {current_bookmarks}/{target_bookmarks}\n\n"
         f"⏳ Expires: {expires_at}\n\n"
-        f"Tap below to raid, then complete."
+        f"Tap 🚀 Join Raid first, raid on X, then return and tap ✅ Complete."
     )
 
 
@@ -250,7 +248,10 @@ def award_raid_xp(cur, raid_id, reward):
     cur.execute("""
         SELECT telegram_id
         FROM completions
-        WHERE raid_id = %s AND eligible = TRUE AND awarded = FALSE
+        WHERE raid_id = %s
+          AND joined = TRUE
+          AND eligible = TRUE
+          AND awarded = FALSE
         ORDER BY completed_at ASC
     """, (raid_id,))
     winners = [row[0] for row in cur.fetchall()]
@@ -393,7 +394,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user)
     await update.message.reply_text(
         "🔥 Welcome to Flik Raidar.\n\n"
-        "Raid. Lock your slot. XP pays only if targets are hit.\n\n"
+        "Tap Join Raid, raid on X, lock your slot, and earn XP if targets are hit.\n\n"
         "Commands:\n"
         "/rank\n"
         "/leaderboard\n"
@@ -480,6 +481,35 @@ async def active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(format_raid_message(*raid_row), reply_markup=raid_buttons())
 
 
+async def join_raid_for_user(user_id):
+    conn = db()
+    cur = conn.cursor()
+
+    raid_row = get_active_raid(cur)
+
+    if not raid_row:
+        conn.commit()
+        cur.close()
+        conn.close()
+        return None, None
+
+    raid_id = raid_row[0]
+    link = raid_row[1]
+
+    cur.execute("""
+        INSERT INTO completions (telegram_id, raid_id, joined, eligible, awarded)
+        VALUES (%s, %s, TRUE, TRUE, FALSE)
+        ON CONFLICT (telegram_id, raid_id)
+        DO UPDATE SET joined = TRUE;
+    """, (user_id, raid_id))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return raid_id, link
+
+
 async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user)
@@ -499,25 +529,50 @@ async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     max_winners = raid_row[3]
 
     cur.execute("""
+        SELECT joined, eligible
+        FROM completions
+        WHERE telegram_id = %s AND raid_id = %s;
+    """, (user.id, raid_id))
+
+    joined_row = cur.fetchone()
+
+    if not joined_row or not joined_row[0]:
+        conn.commit()
+        cur.close()
+        conn.close()
+        await update.message.reply_text("⚠️ You must tap 🚀 Join Raid before completing.")
+        return
+
+    cur.execute("""
         SELECT COUNT(*)
         FROM completions
-        WHERE raid_id = %s AND eligible = TRUE;
+        WHERE raid_id = %s AND eligible = TRUE AND completed_at IS NOT NULL;
     """, (raid_id,))
     eligible_count = cur.fetchone()[0]
 
-    eligible = eligible_count < max_winners
+    cur.execute("""
+        SELECT awarded
+        FROM completions
+        WHERE telegram_id = %s AND raid_id = %s AND completed_at IS NOT NULL;
+    """, (user.id, raid_id))
+    already_completed = cur.fetchone()
 
-    try:
-        cur.execute("""
-            INSERT INTO completions (telegram_id, raid_id, eligible, awarded)
-            VALUES (%s, %s, %s, FALSE);
-        """, (user.id, raid_id, eligible))
-    except psycopg2.errors.UniqueViolation:
-        conn.rollback()
+    if already_completed:
+        conn.commit()
         cur.close()
         conn.close()
         await update.message.reply_text("You already completed this raid.")
         return
+
+    eligible = eligible_count < max_winners
+
+    cur.execute("""
+        UPDATE completions
+        SET eligible = %s,
+            awarded = FALSE,
+            completed_at = NOW()
+        WHERE telegram_id = %s AND raid_id = %s;
+    """, (eligible, user.id, raid_id))
 
     conn.commit()
     cur.close()
@@ -751,6 +806,21 @@ async def bump_active_raid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    if query.data == "join_raid":
+        ensure_user(query.from_user)
+        raid_id, link = await join_raid_for_user(query.from_user.id)
+
+        if not raid_id:
+            await query.message.reply_text("No active raid right now.")
+            return
+
+        await query.message.reply_text(
+            f"🚀 Raid joined.\n\n"
+            f"Open the X raid here:\n{link}\n\n"
+            f"After you finish, return and tap ✅ Complete Raid."
+        )
+        return
 
     if query.data == "open_raid":
         conn = db()
