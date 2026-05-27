@@ -610,17 +610,22 @@ async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     seconds_waited = int(cur.fetchone()[0])
 
     if seconds_waited < JOIN_DELAY_SECONDS:
+        conn.commit()
+        cur.close()
+        conn.close()
 
-    conn.commit()
-    cur.close()
-    conn.close()
+        user_obj = update.effective_user
+        username = getattr(user_obj, "username", None) or getattr(user_obj, "first_name", "user")
 
-    username = update.effective_user.username or update.effective_user.first_name
+        if username.startswith("@"):
+            display_name = username
+        else:
+            display_name = f"@{username}"
 
-    await update.message.reply_text(
-        f"🚩 @{username} flagged — potential username manipulation audit required."
-    )
-    return
+        await update.message.reply_text(
+            f"🚩 {display_name} flagged — potential username manipulation audit required."
+        )
+        return
 
     cur.execute("""
         SELECT COUNT(*)
