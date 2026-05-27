@@ -503,7 +503,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "User flow:\n"
         "Join Raid → Click X link → Complete Raid\n\n"
         "Commands:\n"
-        "/rank\n/leaderboard\n/active\n/complete\n/myid"
+        "/rank\n/leaderboard\n/complete"
     )
 
 
@@ -610,12 +610,17 @@ async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     seconds_waited = int(cur.fetchone()[0])
 
     if seconds_waited < JOIN_DELAY_SECONDS:
-        remaining = JOIN_DELAY_SECONDS - seconds_waited
-        conn.commit()
-        cur.close()
-        conn.close()
-        await update.message.reply_text(f"⏳ Spend at least {JOIN_DELAY_SECONDS} seconds on the raid first. Try again in {remaining} sec.")
-        return
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    username = update.effective_user.username or update.effective_user.first_name
+
+    await update.message.reply_text(
+        f"🚩 @{username} flagged — potential username manipulation audit required."
+    )
+    return
 
     cur.execute("""
         SELECT COUNT(*)
