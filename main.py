@@ -289,7 +289,7 @@ def format_raid_message(
         f"🔁 Reposts: {current_reposts}/{target_reposts}\n"
         f"🔖 Bookmarks: {current_bookmarks}/{target_bookmarks}\n\n"
         f"⏳ Expires: {expires_at}\n\n"
-        f"Tap 🚀 Join Raid first, spend at least {JOIN_DELAY_SECONDS} seconds on X, then return and tap ✅ Complete."
+        f"Tap 🚀 Join Raid first, Click X link , then return and tap ✅ Complete."
     )
 
 
@@ -1016,11 +1016,9 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("raid", raid))
-    app.add_handler(CommandHandler("active", active))
     app.add_handler(CommandHandler("complete", complete))
     app.add_handler(CommandHandler("rank", rank))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
-    app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("settargets", settargets))
     app.add_handler(CommandHandler("addxp", addxp))
     app.add_handler(CommandHandler("removexp", removexp))
